@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use lianad::bip329::Labels;
 use lianad::commands::{GetLabelsBip329Result, UpdateDerivIndexesResult};
 use lianad::payjoin::types::PayjoinInfo;
+use payjoin::bitcoin;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -108,8 +109,11 @@ impl<C: Client + Send + Sync + Debug> Daemon for Lianad<C> {
         )
     }
 
-    async fn receive_payjoin(&self) -> Result<GetAddressResult, DaemonError> {
-        self.call("receivepayjoin", Option::<Request>::None)
+    async fn receive_payjoin(
+        &self,
+        amount: bitcoin::Amount,
+    ) -> Result<GetAddressResult, DaemonError> {
+        self.call("receivepayjoin", Some(vec![amount.to_string()]))
     }
 
     async fn send_payjoin(&self, bip21: String, psbt: &Psbt) -> Result<(), DaemonError> {

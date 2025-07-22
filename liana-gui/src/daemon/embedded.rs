@@ -1,6 +1,7 @@
 use lianad::bip329::Labels;
 use lianad::commands::UpdateDerivIndexesResult;
 use lianad::payjoin::types::PayjoinInfo;
+use payjoin::bitcoin;
 use std::collections::{HashMap, HashSet};
 use tokio::sync::Mutex;
 
@@ -121,10 +122,13 @@ impl Daemon for EmbeddedDaemon {
         .await
     }
 
-    async fn receive_payjoin(&self) -> Result<GetAddressResult, DaemonError> {
+    async fn receive_payjoin(
+        &self,
+        amount: bitcoin::Amount,
+    ) -> Result<GetAddressResult, DaemonError> {
         self.command(|daemon| {
             daemon
-                .receive_payjoin()
+                .receive_payjoin(amount)
                 .map_err(|e| DaemonError::Unexpected(e.to_string()))
         })
         .await

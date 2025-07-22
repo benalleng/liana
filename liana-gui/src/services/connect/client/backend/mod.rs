@@ -624,7 +624,7 @@ impl Daemon for BackendWalletClient {
         })
     }
 
-    async fn receive_payjoin(&self) -> Result<GetAddressResult, DaemonError> {
+    async fn receive_payjoin(&self, _amount: Amount) -> Result<GetAddressResult, DaemonError> {
         unimplemented!()
     }
 

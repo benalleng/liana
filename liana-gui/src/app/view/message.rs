@@ -1,5 +1,6 @@
 use crate::{app::menu::Menu, export::ImportExportMessage, node::bitcoind::RpcAuthType};
 use liana::miniscript::bitcoin::{bip32::Fingerprint, Address, OutPoint};
+use payjoin::bitcoin;
 
 pub trait Close {
     fn close() -> Self;
@@ -31,7 +32,7 @@ pub enum Message {
     HideRescanWarning,
     ExportPsbt,
     ImportPsbt,
-    PayjoinInitiate,
+    PayjoinInitiate(bitcoin::Amount),
 }
 
 impl Close for Message {

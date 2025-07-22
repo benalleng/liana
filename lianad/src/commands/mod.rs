@@ -54,7 +54,7 @@ use payjoin::{
     bitcoin::{key::Secp256k1, FeeRate},
     receive::v2::{replay_event_log as replay_receiver_event_log, Receiver, UninitializedReceiver},
     send::v2::{replay_event_log as replay_sender_event_log, SenderBuilder},
-    Uri, UriExt, Url,
+    PjUri, Uri, UriExt, Url,
 };
 use serde::{Deserialize, Serialize};
 
@@ -382,7 +382,10 @@ impl DaemonControl {
         GetAddressResult::new(address, new_index, None)
     }
 
-    pub fn receive_payjoin(&self) -> Result<GetAddressResult, CommandError> {
+    pub fn receive_payjoin(
+        &self,
+        amount: bitcoin::Amount,
+    ) -> Result<GetAddressResult, CommandError> {
         let mut db_conn = self.db.connection();
 
         // TODO(arturgontijo): Fetch these from DB (via GUI's Settings Panel)
@@ -421,6 +424,9 @@ impl DaemonControl {
         )
         .save(&persister)
         .unwrap();
+
+        let mut pj_uri = session.pj_uri();
+        pj_uri.amount = Some(amount);
 
         Ok(GetAddressResult::new(
             address,

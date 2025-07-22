@@ -24,6 +24,7 @@ use lianad::{
     config::Config,
     StartupError,
 };
+use payjoin::bitcoin;
 
 use crate::{hw::HardwareWalletConfig, node};
 
@@ -115,7 +116,10 @@ pub trait Daemon: Debug {
         limit: usize,
         start_index: Option<ChildNumber>,
     ) -> Result<model::ListRevealedAddressesResult, DaemonError>;
-    async fn receive_payjoin(&self) -> Result<model::GetAddressResult, DaemonError>;
+    async fn receive_payjoin(
+        &self,
+        amount: bitcoin::Amount,
+    ) -> Result<model::GetAddressResult, DaemonError>;
     async fn send_payjoin(&self, bip21: String, psbt: &Psbt) -> Result<(), DaemonError>;
     async fn get_payjoin_info(&self, txid: &Txid) -> Result<Option<PayjoinInfo>, DaemonError>;
     async fn update_deriv_indexes(

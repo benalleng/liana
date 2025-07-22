@@ -7,6 +7,7 @@ use liana::miniscript::bitcoin::{
     Address, Network,
 };
 use liana_ui::{component::modal, widget::*};
+use payjoin::bitcoin;
 use payjoin::Url;
 
 use crate::daemon::model::LabelsLoader;
@@ -318,12 +319,12 @@ impl State for ReceivePanel {
                 }
                 Task::none()
             }
-            Message::View(view::Message::PayjoinInitiate) => {
+            Message::View(view::Message::PayjoinInitiate(amount)) => {
                 let daemon = daemon.clone();
                 Task::perform(
                     async move {
                         daemon
-                            .receive_payjoin()
+                            .receive_payjoin(amount)
                             .await
                             .map(|res| (res.address, res.derivation_index, res.bip21))
                             .map_err(|e| e.into())

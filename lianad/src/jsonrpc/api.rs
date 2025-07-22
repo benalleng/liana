@@ -486,8 +486,14 @@ fn get_labels_bip329(control: &DaemonControl, params: Params) -> Result<serde_js
     Ok(serde_json::json!(control.get_labels_bip329(offset, limit)))
 }
 
-fn receive_payjoin(control: &DaemonControl) -> Result<serde_json::Value, Error> {
-    let res = control.receive_payjoin()?;
+fn receive_payjoin(control: &DaemonControl, params: Params) -> Result<serde_json::Value, Error> {
+    let amount = params
+        .get(0, "amount")
+        .ok_or_else(|| Error::invalid_params("Missing 'amount' parameter."))?
+        .as_str()
+        .ok_or_else(|| Error::invalid_params("Invalid 'amount' parameter."))?;
+    let amount = bitcoin::Amount::from_str(amount).unwrap();
+    let res = control.receive_payjoin(amount)?;
     Ok(serde_json::json!(&res))
 }
 
@@ -627,7 +633,12 @@ pub fn handle_request(control: &mut DaemonControl, req: Request) -> Result<Respo
                 .ok_or_else(|| Error::invalid_params("Missing 'offset' and 'limit' parameters."))?;
             get_labels_bip329(control, params)?
         }
-        "receivepayjoin" => receive_payjoin(control)?,
+        "receivepayjoin" => {
+            let params = req
+                .params
+                .ok_or_else(|| Error::invalid_params("Missing 'amount' parameter."))?;
+            receive_payjoin(control, params)?
+        }
         "sendpayjoin" => {
             let params = req
                 .params

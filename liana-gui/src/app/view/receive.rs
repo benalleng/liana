@@ -17,7 +17,8 @@ use liana::miniscript::bitcoin::{
 
 use liana_ui::{
     component::{
-        button, card, form,
+        button, card,
+        form::{self, Value},
         text::{self, *},
     },
     icon, theme,
@@ -28,7 +29,7 @@ use payjoin::Url;
 use crate::{
     app::{
         error::Error,
-        view::{hw, label, warning::warn},
+        view::{hw, label, warning::warn, CreateSpendMessage},
     },
     hw::HardwareWallet,
 };
@@ -146,11 +147,23 @@ pub fn receive<'a>(
     // Number of start and end address characters to show in collapsed view.
     const NUM_ADDR_CHARS: usize = 16;
     let mut addresses_count = 0; // for counting number of new addresses generated
+    let mut pj_amount: Value<String> = Value {
+        value: "0".to_string(),
+        valid: true,
+    };
     Column::new()
         .push(
             Row::new()
                 .align_y(Alignment::Center)
                 .push(Container::new(h3("Receive")).width(Length::Fill))
+                .push(
+                    form::Form::new_amount_btc("0.001 (in BTC)", &pj_amount, move |amount| {
+                        pj_amount.value = amount
+                    })
+                    .warning("Invalid BIP21")
+                    .size(P1_SIZE)
+                    .padding(10),
+                )
                 .push(
                     button::secondary(Some(icon::plus_icon()), "Payjoin")
                         .on_press(Message::PayjoinInitiate),
