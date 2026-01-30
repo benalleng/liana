@@ -485,7 +485,8 @@ mod tests {
                 Some(json!({"method": "getnewaddress", "params": Option::<Request>::None})),
                 Ok(json!(GetAddressResult::new(
                     addr.clone(),
-                    ChildNumber::from_normal_idx(0).unwrap()
+                    ChildNumber::from_normal_idx(0).unwrap(),
+                    None,
                 ))),
             ),
         ]);

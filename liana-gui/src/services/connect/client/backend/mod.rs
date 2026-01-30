@@ -625,6 +625,7 @@ impl Daemon for BackendWalletClient {
         Ok(GetAddressResult {
             address: res.address,
             derivation_index: res.derivation_index,
+            bip21: None,
         })
     }
 
