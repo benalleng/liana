@@ -247,6 +247,41 @@ pub fn broadcast_action<'a>(
     }
 }
 
+pub fn send_payjoin_action<'a>(warning: Option<&Error>, sent: bool) -> Element<'a, Message> {
+    if sent {
+        card::simple(text("Payjoin proposal sent"))
+            .width(Length::Fixed(400.0))
+            .align_x(iced::alignment::Horizontal::Center)
+            .into()
+    } else {
+        card::simple(
+            Column::new()
+                .spacing(10)
+                .push_maybe(warning.map(|w| warn(Some(w))))
+                .push(Container::new(h4_bold("Send payjoin proposal")).width(Length::Fill))
+                .push(text(
+                    "This will send the signed payjoin proposal to the sender. \
+                    The sender can then sign and broadcast the final transaction.",
+                ))
+                .push(
+                    Row::new()
+                        .spacing(10)
+                        .push(Space::with_width(Length::Fill))
+                        .push(
+                            button::secondary(None, "Cancel")
+                                .on_press(Message::Spend(SpendTxMessage::Cancel)),
+                        )
+                        .push(
+                            button::primary(None, "Send Payjoin")
+                                .on_press(Message::Spend(SpendTxMessage::Confirm)),
+                        ),
+                ),
+        )
+        .width(Length::Fixed(400.0))
+        .into()
+    }
+}
+
 pub fn delete_action<'a>(warning: Option<&Error>, deleted: bool) -> Element<'a, Message> {
     if deleted {
         card::simple(
@@ -417,45 +452,70 @@ pub fn spend_overview_view<'a>(
             .style(theme::card::simple),
         )
         .push_maybe(if tx.status == SpendStatus::Pending {
-            Some(
-                Row::new()
-                    .push(Space::with_width(Length::Fill))
-                    .push_maybe(if tx.path_ready().is_none() {
-                        Some(
-                            button::primary(None, "Sign")
-                                .on_press(Message::Spend(SpendTxMessage::Sign))
-                                .width(Length::Fixed(150.0)),
-                        )
-                    } else {
-                        Some(
-                            button::primary(None, "Broadcast")
-                                .on_press(Message::Spend(SpendTxMessage::Broadcast))
-                                .width(Length::Fixed(150.0)),
-                        )
-                    })
-                    .push_maybe(if tx.path_ready().is_some() {
-                        if let Some(payjoin_status) = &tx.payjoin_status {
-                            if *payjoin_status == PayjoinStatus::Pending {
-                                Some(
-                                    button::secondary(None, "Send Payjoin")
-                                        .on_press(Message::Spend(SpendTxMessage::SendPayjoin))
-                                        .width(Length::Fixed(150.0)),
-                                )
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    })
-                    .align_y(Alignment::Center)
-                    .spacing(20),
-            )
+            let is_payjoin = tx
+                .payjoin_status
+                .is_some_and(|s| !matches!(s, PayjoinStatus::Unknown));
+            Some(if is_payjoin {
+                payjoin_action_buttons(tx)
+            } else {
+                spend_action_buttons(tx)
+            })
         } else {
             None
         })
+        .into()
+}
+
+fn spend_action_buttons(tx: &SpendTx) -> Element<'_, Message> {
+    Row::new()
+        .push(Space::with_width(Length::Fill))
+        .push(if tx.path_ready().is_none() {
+            button::primary(None, "Sign")
+                .on_press(Message::Spend(SpendTxMessage::Sign))
+                .width(Length::Fixed(150.0))
+        } else {
+            button::primary(None, "Broadcast")
+                .on_press(Message::Spend(SpendTxMessage::Broadcast))
+                .width(Length::Fixed(150.0))
+        })
+        .align_y(Alignment::Center)
+        .spacing(20)
+        .into()
+}
+
+fn payjoin_action_buttons(tx: &SpendTx) -> Element<'_, Message> {
+    let session_open = tx.payjoin_status.is_some_and(|s| {
+        matches!(
+            s,
+            PayjoinStatus::Pending | PayjoinStatus::WaitingToSign | PayjoinStatus::ReadyToSend
+        )
+    });
+    let signed = tx.path_ready().is_some();
+    let can_send = signed
+        && matches!(
+            tx.payjoin_status,
+            Some(PayjoinStatus::WaitingToSign) | Some(PayjoinStatus::ReadyToSend)
+        );
+
+    Row::new()
+        .push(Space::with_width(Length::Fill))
+        .push_maybe(can_send.then(|| {
+            button::primary(None, "Send Payjoin")
+                .width(Length::Fixed(150.0))
+                .on_press(Message::Spend(SpendTxMessage::SendPayjoin))
+        }))
+        .push_maybe((!signed).then(|| {
+            button::primary(None, "Sign")
+                .on_press(Message::Spend(SpendTxMessage::Sign))
+                .width(Length::Fixed(150.0))
+        }))
+        .push_maybe(session_open.then(|| {
+            button::secondary(None, "Broadcast Fallback")
+                .on_press(Message::Spend(SpendTxMessage::BroadcastPjFallback))
+                .width(Length::Fixed(150.0))
+        }))
+        .align_y(Alignment::Center)
+        .spacing(20)
         .into()
 }
 
@@ -464,7 +524,28 @@ pub fn signatures<'a>(
     desc_info: &'a LianaPolicy,
     keys_aliases: &'a HashMap<Fingerprint, String>,
 ) -> Element<'a, Message> {
+    let expired_banner = (tx.payjoin_status == Some(PayjoinStatus::Expired)).then(|| {
+        Container::new(
+            scrollable(
+                Row::new()
+                    .spacing(10)
+                    .align_y(Alignment::Center)
+                    .push(p1_bold("Status"))
+                    .push(icon::warning_icon().style(theme::text::warning))
+                    .push(
+                        text("Payjoin session expired — safe to broadcast fallback or delete")
+                            .bold()
+                            .style(theme::text::warning),
+                    ),
+            )
+            .direction(scrollable::Direction::Horizontal(
+                scrollable::Scrollbar::new().width(2).scroller_width(2),
+            )),
+        )
+        .padding(15)
+    });
     Column::new()
+        .push_maybe(expired_banner)
         .push(if tx.status == SpendStatus::PayjoinInitiated {
             Container::new(
                 scrollable(

@@ -506,6 +506,36 @@ fn get_active_payjoin_receiver_sessions(
     Ok(serde_json::json!(&res))
 }
 
+fn send_payjoin_proposal(
+    control: &DaemonControl,
+    params: Params,
+) -> Result<serde_json::Value, Error> {
+    let txid = params
+        .get(0, "txid")
+        .ok_or_else(|| Error::invalid_params("Missing 'txid' parameter."))?
+        .as_str()
+        .ok_or_else(|| Error::invalid_params("Invalid 'txid' parameter."))?;
+    let txid = bitcoin::Txid::from_str(txid)
+        .map_err(|_| Error::invalid_params("Invalid 'txid' parameter."))?;
+    control.send_payjoin_proposal(&txid)?;
+    Ok(serde_json::json!({}))
+}
+
+fn broadcast_payjoin_fallback(
+    control: &DaemonControl,
+    params: Params,
+) -> Result<serde_json::Value, Error> {
+    let txid = params
+        .get(0, "txid")
+        .ok_or_else(|| Error::invalid_params("Missing 'txid' parameter."))?
+        .as_str()
+        .ok_or_else(|| Error::invalid_params("Invalid 'txid' parameter."))?;
+    let txid = bitcoin::Txid::from_str(txid)
+        .map_err(|_| Error::invalid_params("Invalid 'txid' parameter."))?;
+    control.broadcast_payjoin_fallback(&txid)?;
+    Ok(serde_json::json!({}))
+}
+
 /// Handle an incoming JSONRPC2 request.
 pub fn handle_request(control: &mut DaemonControl, req: Request) -> Result<Response, Error> {
     let result = match req.method.as_str() {
@@ -621,6 +651,18 @@ pub fn handle_request(control: &mut DaemonControl, req: Request) -> Result<Respo
             get_payjoin_info(control, params)?
         }
         "getactivepayjoinreceiversessions" => get_active_payjoin_receiver_sessions(control)?,
+        "sendpayjoinproposal" => {
+            let params = req
+                .params
+                .ok_or_else(|| Error::invalid_params("Missing 'txid' parameter."))?;
+            send_payjoin_proposal(control, params)?
+        }
+        "broadcastpayjoinfallback" => {
+            let params = req
+                .params
+                .ok_or_else(|| Error::invalid_params("Missing 'txid' parameter."))?;
+            broadcast_payjoin_fallback(control, params)?
+        }
         _ => {
             return Err(Error::method_not_found());
         }

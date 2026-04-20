@@ -5,8 +5,11 @@ use serde::{Deserialize, Serialize};
 pub enum PayjoinStatus {
     Pending,
     WaitingToSign,
+    ReadyToSend,
+    Monitoring,
     Success,
     Failed,
+    Expired,
     Unknown,
 }
 
@@ -22,13 +25,13 @@ impl From<ReceiveSession> for PayjoinStatus {
             | ReceiveSession::WantsInputs(_)
             | ReceiveSession::WantsFeeRange(_) => PayjoinStatus::Pending,
             ReceiveSession::ProvisionalProposal(_) => PayjoinStatus::WaitingToSign,
-            ReceiveSession::PayjoinProposal(_) => PayjoinStatus::Success,
+            ReceiveSession::PayjoinProposal(_) => PayjoinStatus::ReadyToSend,
             ReceiveSession::HasReplyableError(_) => PayjoinStatus::Failed,
             ReceiveSession::Closed(outcome) => match outcome {
                 ReceiveSessionOutcome::Success(_) => PayjoinStatus::Success,
                 _ => PayjoinStatus::Failed,
             },
-            ReceiveSession::Monitor(_) => PayjoinStatus::Unknown,
+            ReceiveSession::Monitor(_) => PayjoinStatus::Monitoring,
         }
     }
 }
@@ -37,4 +40,10 @@ impl From<ReceiveSession> for PayjoinStatus {
 pub struct PayjoinInfo {
     pub status: PayjoinStatus,
     pub bip21: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PayjoinRole {
+    Receiver,
+    Sender,
 }

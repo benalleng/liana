@@ -15,7 +15,7 @@ use payjoin::{
     receive::{
         v2::{
             replay_event_log, Initialized, MaybeInputsOwned, MaybeInputsSeen, OutputsUnknown,
-            PayjoinProposal, ProvisionalProposal, ReceiveSession, Receiver,
+            PayjoinProposal, ProvisionalProposal, ReceiveSession, Receiver, SessionEvent,
             UncheckedOriginalPayload, WantsFeeRange, WantsInputs, WantsOutputs,
         },
         InputPair,
@@ -26,10 +26,10 @@ use payjoin::{
 use crate::{
     bitcoin::BitcoinInterface,
     database::{Coin, CoinStatus, DatabaseConnection, DatabaseInterface},
-    payjoin::helpers::{finalize_psbt, post_request, OHTTP_RELAY},
+    payjoin::helpers::{finalize_psbt, post_request},
 };
 
-use super::db::ReceiverPersister;
+use super::db::{ReceiverPersister, SessionId};
 
 fn read_from_directory(
     receiver: Receiver<Initialized>,
@@ -38,9 +38,10 @@ fn read_from_directory(
     bit: &mut sync::Arc<sync::Mutex<dyn BitcoinInterface>>,
     desc: &descriptors::LianaDescriptor,
     secp: &secp256k1::Secp256k1<secp256k1::VerifyOnly>,
+    ohttp_relay: &str,
 ) -> Result<(), Box<dyn Error>> {
     let (req, context) = receiver
-        .create_poll_request(OHTTP_RELAY)
+        .create_poll_request(ohttp_relay)
         .map_err(|e| format!("Failed to extract request: {e:?}"))?;
 
     let proposal = match post_request(req.clone()) {
@@ -114,7 +115,7 @@ fn check_no_inputs_seen_before(
 ) -> Result<(), Box<dyn Error>> {
     let proposal = proposal
         .check_no_inputs_seen_before(&mut |outpoint| {
-            let seen = db_conn.insert_input_seen_before(&[*outpoint]);
+            let seen = db_conn.insert_input_seen_before(outpoint);
             Ok(seen)
         })
         .save(persister)?;
@@ -270,15 +271,13 @@ fn finalize_proposal(
         }
 
         if is_signed {
-            let proposal = proposal
+            proposal
                 .finalize_proposal(|_| {
                     let mut psbt = psbt.clone();
                     finalize_psbt(&mut psbt, secp);
                     Ok(psbt)
                 })
                 .save(persister)?;
-
-            send_payjoin_proposal(proposal, persister)?;
         }
     }
     Ok(())
@@ -287,22 +286,161 @@ fn finalize_proposal(
 fn send_payjoin_proposal(
     proposal: Receiver<PayjoinProposal>,
     persister: &ReceiverPersister,
+    ohttp_relay: &str,
 ) -> Result<(), Box<dyn Error>> {
     let (req, ctx) = proposal
-        .create_post_request(OHTTP_RELAY)
-        .expect("Failed to extract request");
+        .create_post_request(ohttp_relay)
+        .map_err(|e| format!("Failed to extract request: {e:?}"))?;
 
-    // Respond to sender
     log::info!("[Payjoin] Receiver responding to sender...");
-    match post_request(req) {
-        Ok(resp) => {
-            proposal
-                .process_response(resp.bytes().expect("Failed to read response").as_ref(), ctx)
-                .save(persister)?;
-        }
-        Err(err) => log::error!("[Payjoin] send_payjoin_proposal(): {}", err),
-    }
+    let resp = post_request(req)?;
+    proposal
+        .process_response(resp.bytes()?.as_ref(), ctx)
+        .save(persister)?;
     Ok(())
+}
+
+/// Extract the payjoin PSBT's txid from a `SessionEvent`, if the event carries one.
+/// Covers `AppliedFeeRange` (ProvisionalProposal-era) and `FinalizedProposal`
+/// (PayjoinProposal-era / Monitor-era) — these together span every state in
+/// which a payjoin PSBT exists, so closed, expired, and monitoring sessions
+/// all match by txid.
+fn payjoin_txid_from_event(event: &SessionEvent) -> Option<bitcoin::Txid> {
+    match event {
+        SessionEvent::FinalizedProposal(psbt) => Some(psbt.unsigned_tx.compute_txid()),
+        SessionEvent::AppliedFeeRange(ctx) => {
+            // PsbtContext::payjoin_psbt is private; round-trip via the
+            // crate's own serde to extract the field by name.
+            let v = serde_json::to_value(ctx).ok()?;
+            let psbt: bitcoin::psbt::Psbt =
+                serde_json::from_value(v.get("payjoin_psbt")?.clone()).ok()?;
+            Some(psbt.unsigned_tx.compute_txid())
+        }
+        _ => None,
+    }
+}
+
+/// Find the receiver session whose payjoin PSBT has the given txid, returning
+/// the session id along with its receive-address derivation index.
+/// First attempts replay and inspects the current state; if replay fails
+/// (e.g. expired) or yields a state whose PSBT isn't directly accessible
+/// (Monitor's `psbt_context` is private upstream), falls back to scanning
+/// the typed event log so monitoring, closed, and expired sessions still
+/// match.
+pub(crate) fn find_receiver_session_by_txid(
+    db: &sync::Arc<sync::Mutex<dyn DatabaseInterface>>,
+    txid: &bitcoin::Txid,
+) -> Option<(SessionId, u32)> {
+    let sessions = {
+        let mut db_conn = db.connection();
+        db_conn.get_all_receiver_sessions()
+    };
+    for (session_id, derivation_index) in sessions {
+        let persister = ReceiverPersister::from_id(Arc::new(db.clone()), session_id.clone());
+        if let Ok((state, _)) = replay_event_log(&persister) {
+            let psbt_txid = match &state {
+                ReceiveSession::ProvisionalProposal(r) => {
+                    Some(r.psbt_to_sign().unsigned_tx.compute_txid())
+                }
+                ReceiveSession::PayjoinProposal(r) => Some(r.psbt().unsigned_tx.compute_txid()),
+                _ => None,
+            };
+            if psbt_txid.as_ref() == Some(txid) {
+                return Some((session_id, derivation_index));
+            }
+        }
+        if let Ok(events) = persister.load() {
+            if events
+                .filter_map(|ev| payjoin_txid_from_event(&ev))
+                .any(|t| t == *txid)
+            {
+                return Some((session_id, derivation_index));
+            }
+        }
+    }
+    None
+}
+
+/// Cancel the payjoin receiver session associated with the given txid and return the
+/// sender's original (non-payjoin) transaction, if one was ever received. Closes the
+/// session via the persister as a terminal transition.
+pub(crate) fn cancel_payjoin_for_session(
+    db: &sync::Arc<sync::Mutex<dyn DatabaseInterface>>,
+    session_id: SessionId,
+) -> Result<Option<bitcoin::Transaction>, Box<dyn Error>> {
+    let persister = ReceiverPersister::from_id(Arc::new(db.clone()), session_id.clone());
+    let (state, _) = match replay_event_log(&persister) {
+        Ok(v) => v,
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("expired") {
+                log::info!(
+                    "Payjoin session {:?} expired during cancel, marking closed",
+                    session_id
+                );
+                let _ = persister.close();
+                return Err("Payjoin session expired.".into());
+            }
+            return Err(format!("Failed to replay receiver event log: {e:?}").into());
+        }
+    };
+    let fallback = match state {
+        ReceiveSession::Initialized(r) => r.cancel().save(&persister)?,
+        ReceiveSession::UncheckedOriginalPayload(r) => r.cancel().save(&persister)?,
+        ReceiveSession::MaybeInputsOwned(r) => r.cancel().save(&persister)?,
+        ReceiveSession::MaybeInputsSeen(r) => r.cancel().save(&persister)?,
+        ReceiveSession::OutputsUnknown(r) => r.cancel().save(&persister)?,
+        ReceiveSession::WantsOutputs(r) => r.cancel().save(&persister)?,
+        ReceiveSession::WantsInputs(r) => r.cancel().save(&persister)?,
+        ReceiveSession::WantsFeeRange(r) => r.cancel().save(&persister)?,
+        ReceiveSession::ProvisionalProposal(r) => r.cancel().save(&persister)?,
+        ReceiveSession::PayjoinProposal(r) => r.cancel().save(&persister)?,
+        ReceiveSession::HasReplyableError(r) => r.cancel().save(&persister)?,
+        ReceiveSession::Monitor(r) => r.cancel().save(&persister)?,
+        ReceiveSession::Closed(_) => return Err("Payjoin session already closed.".into()),
+    };
+    Ok(fallback)
+}
+
+/// Manually send the payjoin proposal for a given session. If the session is still in the
+/// `ProvisionalProposal` state and the stored PSBT is signed, it is finalized first.
+pub(crate) fn send_payjoin_for_session(
+    db: &sync::Arc<sync::Mutex<dyn DatabaseInterface>>,
+    session_id: SessionId,
+    secp: &secp256k1::Secp256k1<secp256k1::VerifyOnly>,
+    ohttp_relay: &str,
+) -> Result<(), Box<dyn Error>> {
+    let persister = ReceiverPersister::from_id(Arc::new(db.clone()), session_id.clone());
+    let (state, _) = match replay_event_log(&persister) {
+        Ok(v) => v,
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("expired") {
+                log::info!(
+                    "Payjoin session {:?} expired during manual send, marking closed",
+                    session_id
+                );
+                let _ = persister.close();
+                return Err("Payjoin session expired.".into());
+            }
+            return Err(format!("Failed to replay receiver event log: {e:?}").into());
+        }
+    };
+    let proposal = match state {
+        ReceiveSession::PayjoinProposal(proposal) => proposal,
+        ReceiveSession::ProvisionalProposal(proposal) => {
+            let mut db_conn = db.connection();
+            finalize_proposal(proposal, &persister, &mut db_conn, secp)?;
+            let (state, _) = replay_event_log(&persister)
+                .map_err(|e| format!("Failed to replay receiver event log: {e:?}"))?;
+            match state {
+                ReceiveSession::PayjoinProposal(proposal) => proposal,
+                _ => return Err("PSBT must be signed before sending the payjoin proposal.".into()),
+            }
+        }
+        _ => return Err("Payjoin session is not ready to send.".into()),
+    };
+    send_payjoin_proposal(proposal, &persister, ohttp_relay)
 }
 
 fn process_receiver_session(
@@ -311,13 +449,14 @@ fn process_receiver_session(
     desc: &descriptors::LianaDescriptor,
     secp: &secp256k1::Secp256k1<secp256k1::VerifyOnly>,
     persister: ReceiverPersister,
+    ohttp_relay: &str,
 ) -> Result<(), Box<dyn Error>> {
     let (state, _) = replay_event_log(&persister)
         .map_err(|e| format!("Failed to replay receiver event log: {e:?}"))?;
 
     match state {
         ReceiveSession::Initialized(context) => {
-            read_from_directory(context, &persister, db_conn, bit, desc, secp)?;
+            read_from_directory(context, &persister, db_conn, bit, desc, secp, ohttp_relay)?;
         }
         ReceiveSession::UncheckedOriginalPayload(proposal) => {
             check_proposal(proposal, &persister, db_conn, bit, desc, secp)?;
@@ -343,13 +482,25 @@ fn process_receiver_session(
         ReceiveSession::ProvisionalProposal(proposal) => {
             finalize_proposal(proposal, &persister, db_conn, secp)?
         }
-        ReceiveSession::PayjoinProposal(proposal) => send_payjoin_proposal(proposal, &persister)?,
+        ReceiveSession::PayjoinProposal(_) => {
+            log::debug!("[Payjoin] Payjoin proposal ready; awaiting manual send");
+        }
         ReceiveSession::Closed(_) | ReceiveSession::HasReplyableError(_) => {
             log::info!("Payjoin session completed or expired, marking as closed");
             persister.close()?;
         }
-        ReceiveSession::Monitor(_) => {
-            log::debug!("Payjoin session in monitoring state");
+        ReceiveSession::Monitor(monitor) => {
+            let bit = bit.clone();
+            monitor
+                .check_payment(|txid| {
+                    let tx_opt = bit
+                        .lock()
+                        .expect("BitcoinInterface mutex poisoned")
+                        .wallet_transaction(&txid)
+                        .map(|(tx, _)| tx);
+                    Ok(tx_opt)
+                })
+                .save(&persister)?;
         }
     }
     Ok(())
@@ -360,6 +511,7 @@ pub(crate) fn payjoin_receiver_check(
     bit: &mut sync::Arc<sync::Mutex<dyn BitcoinInterface>>,
     desc: &descriptors::LianaDescriptor,
     secp: &secp256k1::Secp256k1<secp256k1::VerifyOnly>,
+    ohttp_relay: &str,
 ) {
     let mut db_conn = db.connection();
 
@@ -367,7 +519,14 @@ pub(crate) fn payjoin_receiver_check(
         let persister = ReceiverPersister::from_id(Arc::new(db.clone()), session_id.clone());
 
         match replay_event_log(&persister) {
-            Ok(_) => match process_receiver_session(&mut db_conn, bit, desc, secp, persister) {
+            Ok(_) => match process_receiver_session(
+                &mut db_conn,
+                bit,
+                desc,
+                secp,
+                persister,
+                ohttp_relay,
+            ) {
                 Ok(_) => (),
                 Err(e) => {
                     log::warn!("process_receiver_session(): {}", e);

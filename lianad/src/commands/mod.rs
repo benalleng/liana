@@ -13,7 +13,10 @@ use crate::{
     payjoin::{
         db::ReceiverPersister,
         helpers::{fetch_ohttp_keys, FetchOhttpKeysError},
-        types::PayjoinStatus,
+        receiver::{
+            cancel_payjoin_for_session, find_receiver_session_by_txid, send_payjoin_for_session,
+        },
+        types::{PayjoinRole, PayjoinStatus},
     },
     poller::PollerMessage,
     DaemonControl, VERSION,
@@ -88,6 +91,10 @@ pub enum CommandError {
     FailedToPostOriginalPayjoinProposal(String),
     ReplayError(String),
     IntoUrlError(String),
+    NoPayjoinSessionForTxid(bitcoin::Txid),
+    SendPayjoinFailed(String),
+    CancelPayjoinFailed(String),
+    NoPayjoinFallback(bitcoin::Txid),
 }
 
 impl fmt::Display for CommandError {
@@ -150,6 +157,21 @@ impl fmt::Display for CommandError {
             }
             Self::IntoUrlError(e) => {
                 write!(f, "Payjoin into url failed: '{e}'.")
+            }
+            Self::NoPayjoinSessionForTxid(txid) => {
+                write!(f, "No payjoin receiver session found for txid '{txid}'.")
+            }
+            Self::SendPayjoinFailed(e) => {
+                write!(f, "Failed to send payjoin proposal: '{e}'.")
+            }
+            Self::CancelPayjoinFailed(e) => {
+                write!(f, "Failed to cancel payjoin session: '{e}'.")
+            }
+            Self::NoPayjoinFallback(txid) => {
+                write!(
+                    f,
+                    "No fallback transaction available for payjoin session '{txid}'."
+                )
             }
         }
     }
@@ -418,7 +440,7 @@ impl DaemonControl {
             .derive(new_index, &self.secp)
             .address(self.config.bitcoin_config.network);
 
-        let persister = ReceiverPersister::new(Arc::new(self.db.clone()), new_index.into(), "");
+        let persister = ReceiverPersister::new(Arc::new(self.db.clone()), new_index.into());
         let session = ReceiverBuilder::new(address.clone(), payjoin_dir_url, ohttp_keys)
             .map_err(|e| CommandError::IntoUrlError(e.to_string()))?
             .build()
@@ -432,17 +454,66 @@ impl DaemonControl {
 
     /// Get receiver session and its sender/receiver status by txid
     pub fn get_payjoin_info(&self, txid: &bitcoin::Txid) -> Result<PayjoinStatus, CommandError> {
-        let mut db_conn = self.db.connection();
         log::debug!("Getting payjoin info for txid: {:?}", txid);
-        if let Some(session_id) = db_conn.get_payjoin_receiver_session_id_from_txid(txid) {
+        if let Some((session_id, _)) = find_receiver_session_by_txid(&self.db, txid) {
             let persister =
                 ReceiverPersister::from_id(Arc::new(self.db.clone()), session_id.clone());
-            let (state, _) = replay_receiver_event_log(&persister)
-                .map_err(|e| CommandError::ReplayError(format!("Receiver replay failed: {e:?}")))?;
-            return Ok(state.into());
+            match replay_receiver_event_log(&persister) {
+                Ok((state, _)) => return Ok(state.into()),
+                Err(e) => {
+                    let msg = e.to_string();
+                    if msg.contains("expired") {
+                        log::info!("Payjoin session {:?} expired for tx {:?}", session_id, txid);
+                        return Ok(PayjoinStatus::Expired);
+                    }
+                    return Err(CommandError::ReplayError(format!(
+                        "Receiver replay failed: {e:?}"
+                    )));
+                }
+            }
         }
 
         Ok(PayjoinStatus::Unknown)
+    }
+
+    /// Send a finalized payjoin proposal for the receiver session associated with the given txid.
+    pub fn send_payjoin_proposal(&self, txid: &bitcoin::Txid) -> Result<(), CommandError> {
+        let (session_id, _) = find_receiver_session_by_txid(&self.db, txid)
+            .ok_or(CommandError::NoPayjoinSessionForTxid(*txid))?;
+        let payjoin_config = self
+            .config
+            .payjoin_config
+            .clone()
+            .unwrap_or_else(Config::default_payjoin_config);
+        send_payjoin_for_session(
+            &self.db,
+            session_id,
+            &self.secp,
+            &payjoin_config.ohttp_relay,
+        )
+        .map_err(|e| CommandError::SendPayjoinFailed(e.to_string()))
+    }
+
+    /// Cancel the payjoin receiver session associated with the given txid and immediately
+    /// broadcast the sender's original (non-payjoin) fallback transaction.
+    pub fn broadcast_payjoin_fallback(&self, txid: &bitcoin::Txid) -> Result<(), CommandError> {
+        let (session_id, _) = find_receiver_session_by_txid(&self.db, txid)
+            .ok_or(CommandError::NoPayjoinSessionForTxid(*txid))?;
+        let fallback = cancel_payjoin_for_session(&self.db, session_id)
+            .map_err(|e| CommandError::CancelPayjoinFailed(e.to_string()))?
+            .ok_or(CommandError::NoPayjoinFallback(*txid))?;
+        self.bitcoin
+            .broadcast_tx(&fallback)
+            .map_err(CommandError::TxBroadcast)?;
+
+        let (tx, rx) = mpsc::sync_channel(0);
+        if let Err(e) = self.poller_sender.send(PollerMessage::PollNow(tx)) {
+            log::error!("Error requesting update from poller: {}", e);
+        }
+        if let Err(e) = rx.recv() {
+            log::error!("Error receiving completion signal from poller: {}", e);
+        }
+        Ok(())
     }
 
     /// Get all active payjoin receiver sessions with their derivation indexes
@@ -1338,7 +1409,17 @@ impl DaemonControl {
             .connection()
             .list_wallet_transactions(txids)
             .into_iter()
-            .map(|(tx, height, time)| TransactionInfo { tx, height, time })
+            .map(|(tx, height, time)| {
+                let txid = tx.compute_txid();
+                let payjoin_role =
+                    find_receiver_session_by_txid(&self.db, &txid).map(|_| PayjoinRole::Receiver);
+                TransactionInfo {
+                    tx,
+                    height,
+                    time,
+                    payjoin_role,
+                }
+            })
             .collect();
         ListTransactionsResult { transactions }
     }
@@ -1627,6 +1708,8 @@ pub struct TransactionInfo {
     pub tx: bitcoin::Transaction,
     pub height: Option<i32>,
     pub time: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payjoin_role: Option<PayjoinRole>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

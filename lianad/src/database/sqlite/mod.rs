@@ -482,26 +482,21 @@ impl SqliteConn {
         .expect("Database must be available")
     }
 
-    pub fn insert_outpoint_seen_before<'a>(
-        &mut self,
-        outpoints: impl IntoIterator<Item = &'a bitcoin::OutPoint>,
-    ) -> bool {
+    pub fn insert_outpoint_seen_before(&mut self, outpoint: &bitcoin::OutPoint) -> bool {
         let mut is_duplicate = false;
         db_exec(&mut self.conn, |db_tx| {
-            for outpoint in outpoints {
-                let mut buf = Vec::new();
-                outpoint
-                    .consensus_encode(&mut buf)
-                    .expect("Outpoint must encode");
-                let affected = db_tx.execute(
-                    "INSERT OR IGNORE INTO payjoin_outpoints (outpoint, created_at) \
-                        VALUES (?1, ?2)",
-                    rusqlite::params![buf, curr_timestamp()],
-                )?;
+            let mut buf = Vec::new();
+            outpoint
+                .consensus_encode(&mut buf)
+                .expect("Outpoint must encode");
+            let affected = db_tx.execute(
+                "INSERT OR IGNORE INTO payjoin_outpoints (outpoint, created_at) \
+                    VALUES (?1, ?2)",
+                rusqlite::params![buf, curr_timestamp()],
+            )?;
 
-                if affected == 0 {
-                    is_duplicate = true
-                }
+            if affected == 0 {
+                is_duplicate = true
             }
             Ok(())
         })
@@ -1113,33 +1108,23 @@ impl SqliteConn {
         .unwrap_or_default()
     }
 
-    /// Get receiver session id from txid
-    pub fn get_payjoin_receiver_session_id_from_txid(
-        &mut self,
-        txid: &bitcoin::Txid,
-    ) -> Option<SessionId> {
-        let sessions = self.get_active_payjoin_receiver_sessions();
-        let txid_bytes = txid[..].to_vec();
-        for (session_id, _) in sessions {
-            let events = self.load_receiver_session_events(&session_id);
-            for event in events {
-                if event
-                    .windows(txid_bytes.len())
-                    .any(|w| w == txid_bytes.as_slice())
-                {
-                    return Some(session_id);
-                }
-            }
-        }
-        None
+    /// Get every receiver session (both active and closed) with its derivation index.
+    pub fn get_all_receiver_sessions(&mut self) -> Vec<(SessionId, u32)> {
+        db_query(
+            &mut self.conn,
+            "SELECT id, derivation_index FROM payjoin_receivers WHERE derivation_index IS NOT NULL",
+            rusqlite::params![],
+            |row| {
+                let id: i64 = row.get(0)?;
+                let derivation_index: u32 = row.get(1)?;
+                Ok((SessionId::new(id), derivation_index))
+            },
+        )
+        .expect("Db must not fail")
     }
 
     /// Create new Receiver Session
-    pub fn save_new_payjoin_receiver_session(
-        &mut self,
-        derivation_index: u32,
-        _bip21: &str,
-    ) -> i64 {
+    pub fn save_new_payjoin_receiver_session(&mut self, derivation_index: u32) -> i64 {
         let mut id = 0i64;
         db_exec(&mut self.conn, |db_tx| {
             db_tx.execute(
