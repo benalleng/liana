@@ -50,6 +50,7 @@ pub(crate) fn fetch_ohttp_keys(
     .map_err(|e| FetchOhttpKeysError::Reqwest(e.to_string()))?;
     let client = reqwest::blocking::Client::builder()
         .proxy(proxy)
+        .timeout(Duration::from_secs(15))
         .build()
         .map_err(|e| FetchOhttpKeysError::Reqwest(e.to_string()))?;
     let res = client
