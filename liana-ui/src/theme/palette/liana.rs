@@ -17,6 +17,7 @@ impl Palette {
                 success: color::GREEN,
                 error: color::RED,
                 accent: color::BLUE,
+                payjoin: color::PAYJOIN_PINK,
             },
             buttons: Buttons {
                 border_width: 1.0,

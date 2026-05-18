@@ -33,6 +33,7 @@ pub struct Text {
     pub success: iced::Color,
     pub error: iced::Color,
     pub accent: iced::Color,
+    pub payjoin: iced::Color,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq)]

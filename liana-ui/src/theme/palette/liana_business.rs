@@ -62,6 +62,7 @@ impl Palette {
                 success: color::DARK_GREEN,
                 error: color::RED,
                 accent: color::BUSINESS_BLUE_DARK,
+                payjoin: color::PAYJOIN_PINK,
             },
             buttons: Buttons {
                 border_width: 3.0,

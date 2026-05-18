@@ -7,11 +7,12 @@ mod utils;
 
 use crate::{
     bitcoin::BitcoinInterface,
+    config::Config,
     database::{Coin, DatabaseConnection, DatabaseInterface},
     miniscript::bitcoin::absolute::LockTime,
     payjoin::{
         db::ReceiverPersister,
-        helpers::{fetch_ohttp_keys, FetchOhttpKeysError, OHTTP_RELAY, PAYJOIN_DIRECTORY},
+        helpers::{fetch_ohttp_keys, FetchOhttpKeysError},
         types::PayjoinStatus,
     },
     poller::PollerMessage,
@@ -384,15 +385,24 @@ impl DaemonControl {
     pub fn receive_payjoin(&self) -> Result<GetAddressResult, CommandError> {
         let mut db_conn = self.db.connection();
 
-        let ohttp_keys = if let Some(entry) = db_conn.payjoin_get_ohttp_keys(OHTTP_RELAY) {
+        let payjoin_config = self
+            .config
+            .payjoin_config
+            .clone()
+            .unwrap_or_else(Config::default_payjoin_config);
+        let ohttp_relay_url = payjoin_config.ohttp_relay.clone();
+        let payjoin_dir_url = payjoin_config.payjoin_directory.clone();
+
+        let ohttp_keys = if let Some(entry) = db_conn.payjoin_get_ohttp_keys(&ohttp_relay_url) {
             entry.1
         } else {
-            let ohttp_keys =
-                std::thread::spawn(move || fetch_ohttp_keys(OHTTP_RELAY, PAYJOIN_DIRECTORY))
-                    .join()
-                    .unwrap()
-                    .map_err(CommandError::FailedToFetchOhttpKeys)?;
-            db_conn.payjoin_save_ohttp_keys(OHTTP_RELAY, ohttp_keys.clone());
+            let ohttp_relay = ohttp_relay_url.clone();
+            let payjoin_dir = payjoin_dir_url.clone();
+            let ohttp_keys = std::thread::spawn(move || fetch_ohttp_keys(ohttp_relay, payjoin_dir))
+                .join()
+                .unwrap()
+                .map_err(CommandError::FailedToFetchOhttpKeys)?;
+            db_conn.payjoin_save_ohttp_keys(&ohttp_relay_url, ohttp_keys.clone());
             ohttp_keys
         };
 
@@ -409,7 +419,7 @@ impl DaemonControl {
             .address(self.config.bitcoin_config.network);
 
         let persister = ReceiverPersister::new(Arc::new(self.db.clone()), new_index.into(), "");
-        let session = ReceiverBuilder::new(address.clone(), PAYJOIN_DIRECTORY, ohttp_keys)
+        let session = ReceiverBuilder::new(address.clone(), payjoin_dir_url, ohttp_keys)
             .map_err(|e| CommandError::IntoUrlError(e.to_string()))?
             .build()
             .save(&persister)
@@ -417,13 +427,10 @@ impl DaemonControl {
 
         let bip21 = session.pj_uri().to_string();
 
-        let mut db_conn = self.db.connection();
-        db_conn.update_payjoin_receiver_bip21(new_index.into(), &bip21);
-
         Ok(GetAddressResult::new(address, new_index, Some(bip21)))
     }
 
-    /// Get Payjoin URI (BIP21) and its sender/receiver status by txid
+    /// Get receiver session and its sender/receiver status by txid
     pub fn get_payjoin_info(&self, txid: &bitcoin::Txid) -> Result<PayjoinStatus, CommandError> {
         let mut db_conn = self.db.connection();
         log::debug!("Getting payjoin info for txid: {:?}", txid);
@@ -439,16 +446,10 @@ impl DaemonControl {
     }
 
     /// Get all active payjoin receiver sessions with their derivation indexes
-    pub fn get_active_payjoin_sessions(&self) -> Result<Vec<u32>, CommandError> {
+    pub fn get_active_payjoin_receiver_sessions(&self) -> Result<Vec<u32>, CommandError> {
         let mut db_conn = self.db.connection();
-        let sessions = db_conn.get_active_payjoin_sessions();
+        let sessions = db_conn.get_active_payjoin_receiver_sessions();
         Ok(sessions.into_iter().map(|(_, idx)| idx).collect())
-    }
-
-    /// Get payjoin BIP21 URI for a specific derivation index
-    pub fn get_payjoin_bip21(&self, derivation_index: u32) -> Result<Option<String>, CommandError> {
-        let mut db_conn = self.db.connection();
-        Ok(db_conn.get_payjoin_receiver_bip21(derivation_index))
     }
 
     /// Update derivation indexes
@@ -993,7 +994,20 @@ impl DaemonControl {
         for index in 0..spend_psbt.inputs.len() {
             match spend_psbt.finalize_inp_mut(&self.secp, index) {
                 Ok(_) => log::debug!("Finalizing input at: {}", index),
-                Err(e) => log::error!("Not finalizing input at: {} | {}", index, e),
+                Err(e) => {
+                    // If the input is already finalized (e.g. a payjoin sender input that
+                    // arrived with final_script_witness already set), ignore the error.
+                    // Otherwise, the transaction can't be broadcast — return an error.
+                    let input = &spend_psbt.inputs[index];
+                    if input.final_script_witness.is_none() && input.final_script_sig.is_none() {
+                        return Err(CommandError::SpendFinalization(e.to_string()));
+                    }
+                    log::debug!(
+                        "Input at index {} already finalized, skipping: {}",
+                        index,
+                        e
+                    );
+                }
             }
         }
 

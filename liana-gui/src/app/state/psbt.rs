@@ -264,9 +264,8 @@ impl PsbtState {
             Message::Export(ImportExportMessage::Progress(Progress::Psbt(psbt))) => {
                 merge_signatures(&mut self.tx.psbt, &psbt);
                 self.tx.sigs = self
-                    .wallet
-                    .main_descriptor
-                    .partial_spend_info(&self.tx.psbt)
+                    .tx
+                    .partial_spend_info(&self.wallet.main_descriptor)
                     .expect("already check in psbt import logic");
             }
             _ => {
@@ -564,7 +563,7 @@ impl Modal for SignModal {
                 }
             }
             Message::Updated(res) => match res {
-                Ok(()) => match self.wallet.main_descriptor.partial_spend_info(&tx.psbt) {
+                Ok(()) => match tx.partial_spend_info(&self.wallet.main_descriptor) {
                     Ok(sigs) => tx.sigs = sigs,
                     Err(e) => self.error = Some(Error::Unexpected(e.to_string())),
                 },
@@ -748,6 +747,12 @@ mod tests {
                     "is_from_self": false,
 
                 }]})),
+            ),
+            (
+                Some(
+                    json!({"method": "getpayjoininfo", "params": vec!["4bc07e8fe753f7314b69da02a7cfbedc3e4e0d5fbee316a048240ae87b8aaa58"]}),
+                ),
+                Ok(json!({ "Unknown": null})),
             ),
             (
                 Some(json!({"method": "getlabels", "params": vec![vec![
