@@ -54,5 +54,5 @@ jsonrpc = { workspace = true, features = ["minreq_http"], default-features = fal
 bip329 = { workspace = true, default-features = false }
 
 # payjoin
-payjoin = { git = "https://github.com/xstoicunicornx/rust-payjoin.git", rev = "af81bd713e8ff2910049f3338ed33a4f65929323", features = ["v2", "io"] }
+payjoin = { git = "https://github.com/xstoicunicornx/rust-payjoin.git", rev = "af81bd713e8ff2910049f3338ed33a4f65929323", features = ["v2"] }
 reqwest = { version = "0.11", default-features=false, features = ["json", "rustls-tls", "stream", "blocking"] }
