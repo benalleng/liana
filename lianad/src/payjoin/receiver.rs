@@ -4,7 +4,7 @@ use std::{
     sync::{self, Arc},
 };
 
-use liana::{descriptors, spend::AddrInfo};
+use liana::descriptors;
 
 use payjoin::{
     bitcoin::{
@@ -13,6 +13,7 @@ use payjoin::{
     },
     persist::{OptionalTransitionOutcome, SessionPersister},
     receive::{
+        check_references,
         v2::{
             replay_event_log, Initialized, MaybeInputsOwned, MaybeInputsSeen, OutputsUnknown,
             PayjoinProposal, ProvisionalProposal, ReceiveSession, Receiver, SessionEvent,
@@ -72,14 +73,14 @@ fn check_proposal(
     secp: &secp256k1::Secp256k1<secp256k1::VerifyOnly>,
 ) -> Result<(), Box<dyn Error>> {
     // Receive Check 1: Can Broadcast
+    let tx = proposal.extract_tx_to_check_broadcast_suitability();
+    let can_broadcast = bit
+        .test_mempool_accept(vec![serialize_hex(&tx)])
+        .first()
+        .copied()
+        .unwrap_or(false);
     let proposal = proposal
-        .check_broadcast_suitability(None, |tx| {
-            let result = bit.test_mempool_accept(vec![serialize_hex(tx)]);
-            match result.first().cloned() {
-                Some(can_broadcast) => Ok(can_broadcast),
-                None => Ok(false),
-            }
-        })
+        .apply_broadcast_suitability(None, can_broadcast)
         .save(persister)?;
     check_inputs_not_owned(proposal, persister, db_conn, desc, secp)
 }
@@ -91,18 +92,16 @@ fn check_inputs_not_owned(
     desc: &descriptors::LianaDescriptor,
     secp: &secp256k1::Secp256k1<secp256k1::VerifyOnly>,
 ) -> Result<(), Box<dyn Error>> {
-    let proposal = proposal
-        .check_inputs_not_owned(&mut |script| {
-            let address =
-                bitcoin::Address::from_script(script, db_conn.network()).map_err(|e| {
-                    ImplementationError::from(Box::new(e) as Box<dyn Error + Send + Sync>)
-                })?;
-            Ok(db_conn
-                .derivation_index_by_address(&address)
-                .map(|(index, is_change)| AddrInfo { index, is_change })
-                .is_some())
-        })
-        .save(persister)?;
+    let network = db_conn.network();
+    let refs = proposal
+        .get_input_script_refs()
+        .map_err(|e| format!("get_input_script_refs: {e:?}"))?;
+    let checked = check_references(refs, &mut |script| {
+        let address = bitcoin::Address::from_script(script, network)
+            .map_err(|e| ImplementationError::from(Box::new(e) as Box<dyn Error + Send + Sync>))?;
+        Ok(db_conn.derivation_index_by_address(&address).is_some())
+    })?;
+    let proposal = proposal.apply_input_owned_checks(checked).save(persister)?;
     check_no_inputs_seen_before(proposal, persister, db_conn, desc, secp)
 }
 
@@ -113,12 +112,11 @@ fn check_no_inputs_seen_before(
     desc: &descriptors::LianaDescriptor,
     secp: &secp256k1::Secp256k1<secp256k1::VerifyOnly>,
 ) -> Result<(), Box<dyn Error>> {
-    let proposal = proposal
-        .check_no_inputs_seen_before(&mut |outpoint| {
-            let seen = db_conn.insert_input_seen_before(outpoint);
-            Ok(seen)
-        })
-        .save(persister)?;
+    let refs = proposal.get_input_outpoint_refs();
+    let checked = check_references(refs, &mut |outpoint| {
+        Ok(db_conn.insert_input_seen_before(outpoint))
+    })?;
+    let proposal = proposal.apply_input_seen_checks(checked).save(persister)?;
     identify_receiver_outputs(proposal, persister, db_conn, desc, secp)
 }
 
@@ -130,17 +128,15 @@ fn identify_receiver_outputs(
     secp: &secp256k1::Secp256k1<secp256k1::VerifyOnly>,
 ) -> Result<(), Box<dyn Error>> {
     log::debug!("[Payjoin] receiver outputs");
+    let network = db_conn.network();
+    let refs = proposal.get_output_script_refs();
+    let checked = check_references(refs, &mut |script| {
+        let address = bitcoin::Address::from_script(script, network)
+            .map_err(|e| ImplementationError::from(Box::new(e) as Box<dyn Error + Send + Sync>))?;
+        Ok(db_conn.derivation_index_by_address(&address).is_some())
+    })?;
     let proposal = proposal
-        .identify_receiver_outputs(&mut |script| {
-            let address =
-                bitcoin::Address::from_script(script, db_conn.network()).map_err(|e| {
-                    ImplementationError::from(Box::new(e) as Box<dyn Error + Send + Sync>)
-                })?;
-            Ok(db_conn
-                .derivation_index_by_address(&address)
-                .map(|(index, is_change)| AddrInfo { index, is_change })
-                .is_some())
-        })
+        .apply_output_owned_checks(checked)
         .save(persister)?;
     commit_outputs(proposal, persister, db_conn, desc, secp)
 }
@@ -260,23 +256,17 @@ fn finalize_proposal(
     let psbt = proposal.psbt_to_sign();
 
     let txid = psbt.unsigned_tx.compute_txid();
-    if let Some(psbt) = db_conn.spend_tx(&txid) {
-        let mut is_signed = false;
-        for psbtin in &psbt.inputs {
-            if !psbtin.partial_sigs.is_empty() {
-                log::debug!("[Payjoin] PSBT is signed!");
-                is_signed = true;
-                break;
-            }
-        }
+    if let Some(mut signed_psbt) = db_conn.spend_tx(&txid) {
+        let is_signed = signed_psbt
+            .inputs
+            .iter()
+            .any(|psbtin| !psbtin.partial_sigs.is_empty());
 
         if is_signed {
+            log::debug!("[Payjoin] PSBT is signed!");
+            finalize_psbt(&mut signed_psbt, secp);
             proposal
-                .finalize_proposal(|_| {
-                    let mut psbt = psbt.clone();
-                    finalize_psbt(&mut psbt, secp);
-                    Ok(psbt)
-                })
+                .finalize_signed_proposal(&signed_psbt)
                 .save(persister)?;
         }
     }
@@ -490,17 +480,25 @@ fn process_receiver_session(
             persister.close()?;
         }
         ReceiveSession::Monitor(monitor) => {
-            let bit = bit.clone();
-            monitor
-                .check_payment(|txid| {
-                    let tx_opt = bit
-                        .lock()
-                        .expect("BitcoinInterface mutex poisoned")
-                        .wallet_transaction(&txid)
-                        .map(|(tx, _)| tx);
-                    Ok(tx_opt)
-                })
-                .save(&persister)?;
+            // Closes the session early if the fallback isn't monitorable (non-SegWit).
+            if let OptionalTransitionOutcome::Progress(()) =
+                monitor.check_fallback_monitorable().save(&persister)?
+            {
+                return Ok(());
+            }
+            let pj_txid = monitor.extract_payjoin_proposal_txid();
+            let fb_txid = monitor.extract_fallback_txid();
+            let (pj_tx, fb_seen) = {
+                let bit = bit.lock().expect("BitcoinInterface mutex poisoned");
+                let pj = bit.wallet_transaction(&pj_txid).map(|(tx, _)| tx);
+                let fb = bit.wallet_transaction(&fb_txid).is_some();
+                (pj, fb)
+            };
+            if let Some(tx) = pj_tx {
+                monitor.payjoin_tx_exists(tx).save(&persister)?;
+            } else if fb_seen {
+                monitor.fallback_tx_exists().save(&persister)?;
+            }
         }
     }
     Ok(())
